@@ -1,151 +1,236 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, HttpUrl, Field
 from pymongo import MongoClient
 import json
-from nlp_module import find_closest_words
-from nlp_module import find_farthest_words
-from nlp_module import find_most_similar_news
-from nlp_module import find_most_dissimilar_news
 import random
+from typing import List
+from fastapi import status
+from bson import ObjectId
+from openai import OpenAI
+import os
+from fastapi.encoders import jsonable_encoder
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import pydantic
+pydantic.json.ENCODERS_BY_TYPE[ObjectId] = str
+
+
+
+OPENAI_API_KEY = ""
+openAIClient = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # FastAPI 인스턴스 생성
 app = FastAPI()
 
 # MongoDB 연결 설정
-client = MongoClient("mongodb://localhost:27017/")  # MongoDB 연결 주소
-db = client["helmut"]  # 데이터베이스 이름
+client = MongoClient("mongodb://localhost:27017/")  
+db = client["stogee"] 
 
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 origin을 허용하며, 필요에 따라 변경 가능
+    allow_origins=["*"], 
 
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 class User(BaseModel):
-    email: str
+    email: EmailStr
     password: str
-    interests: list
-    domain: list
-# 유저 정보를 위한 Pydantic 모델
-class UserInterest(BaseModel):
-    email: str
-    # password: str
-    interests: list
-    domain: list
 
-class Test(BaseModel):
-    email: str
-    score : float
-# 로그인을 처리하는 엔드포인트
+class Category(BaseModel):
+    name: str
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    categories: List[Category]
+
+
+class LinkCreate(BaseModel):
+    linkUrl: HttpUrl
+    title: str
+    email: EmailStr
+    
+class PieceCreate(BaseModel):
+    linkUrl: HttpUrl
+    sentence: str
+    email: EmailStr
+    
+class UserCategory(BaseModel):
+    id: str 
+    name: str
+    
+class UserCategoriesResponse(BaseModel):
+    categories: List[UserCategory]
+    
+
+    
+@app.post("/users/", response_model=User, status_code=status.HTTP_201_CREATED)
+def create_user(user: UserCreate):
+    existing_user = db.users.find_one({"email": user.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    categories_with_ids = [{"_id": ObjectId(), **category.dict()} for category in user.categories]
+    
+    user_data = {
+        "email": user.email,
+        "password": user.password,
+        "categories": categories_with_ids
+    }
+    
+    db.users.insert_one(user_data)
+    
+    # 응답 시 비밀번호를 숨기기
+    return User(email=user.email, password="****")
+
+
 @app.post("/login/")
-async def login(user: User):
-    users_collection = db["users"]
-    user_data = users_collection.find_one({"email": user.email, "password": user.password})
-    if user_data:
-        return {"message": "로그인 성공"}
-    else:
-        raise HTTPException(status_code=401, detail="유효하지 않은 사용자")
+def login(user: User):
+    # MongoDB에서 사용자 정보를 조회
+    user_info = db.users.find_one({"email": user.email})
+    if not user_info or user_info['password'] != user.password:
+        raise HTTPException(status_code=400, detail="Incorrect email or password")
+    return {"message": "Login successful"}
 
-# 사용자 정보를 추가하는 엔드포인트
-@app.post("/user/add_info/")
-async def add_user_info(user: UserInterest):
-    # MongoDB에서 기존 사용자를 찾음
-    users_collection = db["users"]
-    existing_user = users_collection.find_one({"email": user.email})
 
-    if existing_user:
-        # 기존 사용자 정보에 새로운 데이터 추가
-        updated_data = {
-            "$push": {
-                "interests": {"$each": user.interests},
-                "domain": {"$each": user.domain}
-            }
-        }
-        users_collection.update_one({"email": user.email}, updated_data)
-        return {"message": "사용자 정보가 업데이트되었습니다."}
-    else:
-        return {"message": "사용자를 찾을 수 없습니다."}
+@app.post("/links/", status_code=201)
+def create_link(link_data: LinkCreate):
+    print("링크 데이터:", link_data)
+    user_info = db.users.find_one({"email": link_data.email})
+    if not user_info:
+        raise HTTPException(status_code=404, detail="User not found")
+    category_name = []
+    for category in user_info['categories']:
+        category_name.append(category['name'])
+        
+    print('카테고리 이름:', category_name)
     
-@app.post("/user/add_test/")
-async def add_user_info(user: Test):
-    # MongoDB에서 기존 사용자를 찾음
-    users_collection = db["users"]
-    existing_user = users_collection.find_one({"email": user.email})
-    if existing_user:
-        # 기존 사용자 정보에 새로운 데이터 추가
-        if "recentScore" not in existing_user:  
-            existing_user["recentScore"] = []
-
-        # 새로운 점수를 recentScore에 추가하고 이전 점수를 prevScore로 유지
-        if "score" in user.dict():
-            print(existing_user.get("recentScore"),user.dict()["score"])
-            existing_user["prevScore"] = existing_user.get("recentScore")
-            existing_user["recentScore"] = user.dict()["score"]
-
-            # MongoDB 업데이트
-            users_collection.update_one({"email": user.email}, {"$set": existing_user})
-            return {"message": "사용자 정보가 업데이트되었습니다."}
-        else:
-            return {"message": "새로운 점수가 제공되지 않았습니다."}
-    else:
-        return {"message": "사용자를 찾을 수 없습니다."}
+    # # OPENAI API 호출코드 (실제 사용 시 주석 해제 필요)
+    # messages = [{"role": "system", "content": "title:str, categories:str[]이 입력값으로 제공되면 너는 category와 keywords를 리턴할거야. category는 title에 해당하는 카테고리를 categories 배열중에서 한개만 골라. keywords는 title과 관련된 키워드를 단어로 5개 만들어서 함께 반환해. 반환형태는 Json으로, category는 str, keywords도 str 배열로."}]
+    # messages.append({"role": "user", "content": "{'title' : {link_data.title}, 'categories' : {category_name}}"})
     
-class GetUser(BaseModel):
-    email : str
-@app.post("/users/")
-async def get_user_info(user : GetUser):
-    # MongoDB에서 사용자 정보 가져오기
-    users_collection = db["users"]
-    existing_user = users_collection.find_one({"email": user.email})
-    print("hele",existing_user)
-    result_dict = {}
-    result_dict["email"] =existing_user["email"]
-    result_dict["domain"] =existing_user["domain"]
-    result_dict["interests"] =existing_user["interests"]
-    result_dict["recentScore"] =existing_user["recentScore"]
-    result_dict["prevScore"] =existing_user["prevScore"]
-    return result_dict
-
-
-
-@app.post("/smililarity/")
-async def get_user_info(user : GetUser):
-    users_collection = db["users"]
-    existing_user = users_collection.find_one({"email": user.email})
-    input = existing_user["interests"] + existing_user["domain"]
+    # completion  = openAIClient.chat.completions.create(
+    #     model="gpt-3.5-turbo",
+    #     messages=messages,
+    #     temperature=1,
+    #     top_p=1,
+    # )
+    # answer = json.loads(completion.choices[0].message.content)
     
-    vocas = list(db["vocas"].find({}, {"_id": 0}))
-    closest = random.sample(find_closest_words(input, vocas),2)
-    farthest = random.sample(find_farthest_words(input,vocas),1)
-    return closest + farthest
-
-
-
-@app.post("/news/smililarity/")
-async def get_user_info(user : GetUser):
-    users_collection = db["users"]
-    existing_user = users_collection.find_one({"email": user.email})
-    input = existing_user["interests"] + existing_user["domain"]
+    # 테스트용 OPENAI API 응답 예시
+    answer = {'category': 'technology', 'keywords': ['fastapi', 'data science', 'backend', 'software development', 'project']}
+    print("응답",answer)
     
-    news = list(db["news"].find({"개체명(지역)": "대구"}, {"_id": 0}))
-    similar_news = random.sample(find_most_similar_news(input, news),2)
-    oppsite_news = random.sample(find_most_dissimilar_news(input, news), 1)
-    result_news = similar_news + oppsite_news
-    response = []
-    for item in result_news:
-        result_dict = {}
-        result_dict['일자'] = item['일자']
-        result_dict['언론사'] = item['언론사']
-        result_dict['제목'] = item['제목']
-        result_dict['주소'] = item['주소']       
-        response.append(result_dict) 
-    return response
-    # return result_news
-
     
+    selected_category = None
+    for category in user_info['categories']:
+        if category['name'] == answer['category']:
+            selected_category = category
+            print("선택된 카테고리:", selected_category)
+            break
 
+    # 새로운 링크 문서 생성
+    link_document = {
+        "userId": user_info["_id"],
+        "linkUrl": link_data.linkUrl,
+        "title": link_data.title,
+        "category": selected_category,
+        "keywords": answer['keywords']
+    }
+    db.links.insert_one(link_document)
     
+    return {"message": "Link created successfully", "link": link_document}
+
+@app.post("/pieces/", status_code=201)
+def create_piece(piece_data: PieceCreate):
+    print("조각 데이터:", piece_data)
+    user_info = db.users.find_one({"email": piece_data.email})
+    if not user_info:
+        raise HTTPException(status_code=404, detail="User not found")
+    category_name = []
+    for category in user_info['categories']:
+        category_name.append(category['name'])
+        
+    print('카테고리 이름:', category_name)
+    
+    # # OPENAI API 호출코드 (실제 사용 시 주석 해제 필요)
+    # messages = [{"role": "system", "content": "sentence:str, categories:str[]이 입력값으로 제공되면 너는 category와 keywords 와 title을 리턴할거야. category는 sentence에 해당하는 카테고리를 categories 배열중에서 한개만 골라. keywords는 sentence와 관련된 키워드를 단어로 5개 만들어서 함께 반환해. title은 니가 알맞는 제목을 지어봐. 반환형태는 Json으로, category는 str, keywords도 str 배열로. title은 str로."}]
+    # messages.append({"role": "user", "content": "{'title' : {piece_data.title}, 'categories' : {category_name}}"})
+    
+    # completion  = openAIClient.chat.completions.create(
+    #     model="gpt-3.5-turbo",
+    #     messages=messages,
+    #     temperature=1,
+    #     top_p=1,
+    # )
+    # answer = json.loads(completion.choices[0].message.content)
+    
+    # 테스트용 OPENAI API 응답 예시
+    answer = {'category': 'travel', 'keywords': ['일본여행', '일본 벚꽃', '오사카', '오사카 벚꽃', '도톤보리'], 'title': '오사카 벚꽃 여행'}
+    print("응답",answer)
+    
+    
+    selected_category = None
+    for category in user_info['categories']:
+        if category['name'] == answer['category']:
+            selected_category = category
+            print("선택된 카테고리:", selected_category)
+            break
+
+    # 새로운 링크 문서 생성
+    link_document = {
+        "userId": user_info["_id"],
+        "linkUrl": piece_data.linkUrl,
+        "sentence": piece_data.sentence,
+        "category": selected_category,
+        'title' : answer['title'],
+        "keywords": answer['keywords']
+    }
+    db.pieces.insert_one(link_document)
+    
+    return {"message": "Link created successfully", "link": link_document}
+
+@app.get("/user/{email}/categories", response_model=UserCategoriesResponse)
+def get_user_categories(email: str):
+    # MongoDB에서 사용자 데이터를 조회
+    user_info = db.users.find_one({"email": email})
+    if not user_info:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    categories = [
+         {"id": str(category["_id"]), "name": category["name"]}
+        for category in user_info.get('categories', [])
+    ]
+
+    return UserCategoriesResponse(categories=categories)
+
+@app.get("/link/categories/{categoryId}/content")
+def get_links_by_category(categoryId: str):
+    # MongoDB에서 category_id가 categoryId와 일치하는 모든 링크를 검색
+    print("카테고리 ID:", categoryId)
+    links = list(db.links.find({"category._id": ObjectId(categoryId)}))
+    return links
+    # 검색된 링크가 없을 경우 404 에러 처리
+    if not links:
+        raise HTTPException(status_code=404, detail="No links found for this category")
+
+@app.get("/piece/categories/{categoryId}/content")
+def get_links_by_category(categoryId: str):
+    # MongoDB에서 category_id가 categoryId와 일치하는 모든 링크를 검색
+    print("카테고리 ID:", categoryId)
+    links = list(db.pieces.find({"category._id": ObjectId(categoryId)}))
+    return links
+    # 검색된 링크가 없을 경우 404 에러 처리
+    if not links:
+        raise HTTPException(status_code=404, detail="No links found for this category")
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
